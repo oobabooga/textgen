@@ -399,12 +399,24 @@ def update_gpu_layers_and_vram(loader, model, gpu_layers, ctx_size, cache_type):
 
 def load_template_by_name(name):
     """Find and load a single instruction template by name. Returns '' if not found."""
+    # Prevent path traversal: strip all directory components, keep only the filename
+    name = Path(name).name
+    if not name:
+        return ''
+
     template_dir = shared.user_data_dir / 'instruction-templates'
     for ext in utils.TEMPLATE_EXTENSIONS:
         path = template_dir / f'{name}{ext}'
         if path.is_file():
             break
     else:
+        return ''
+
+    # Defense-in-depth: confirm resolved path stays inside template_dir
+    try:
+        path.resolve().relative_to(template_dir.resolve())
+    except ValueError:
+        logger.error(f'Path traversal blocked for instruction template name: {name!r}')
         return ''
 
     file_contents = path.read_text(encoding='utf-8')

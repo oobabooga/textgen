@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 # Define the required versions
-TORCH_VERSION = "2.9.1"
+TORCH_VERSION = "2.9.0"
 PYTHON_VERSION = "3.13"
 LIBSTDCXX_VERSION_LINUX = "12.1.0"
 

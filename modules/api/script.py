@@ -95,13 +95,18 @@ check_key = [Depends(verify_api_key)]
 check_admin_key = [Depends(verify_admin_key)]
 check_anthropic_key = [Depends(verify_anthropic_key)]
 
-# Configure CORS settings to allow all origins, methods, and headers
+# --listen/--public-api opts into network exposure; otherwise lock to localhost.
+if shared.args.listen or shared.args.public_api:
+    cors_kwargs = {"allow_origins": ["*"]}
+else:
+    cors_kwargs = {"allow_origin_regex": r"https?://(localhost|127\.0\.0\.1)(:\d+)?"}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
+    **cors_kwargs,
 )
 
 
@@ -351,7 +356,20 @@ async def handle_audio_transcription(request: Request):
     r = sr.Recognizer()
 
     form = await request.form()
-    audio_file = await form["file"].read()
+    file = form["file"]
+
+    # Sanitize filename and validate file extension
+    filename = os.path.basename(file.filename or '')
+    ext = os.path.splitext(filename)[1].lower()
+    allowed_extensions = {'.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm', '.ogg', '.flac'}
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    # Enforce file size limit (25 MB)
+    audio_file = await file.read()
+    if len(audio_file) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large")
+
     audio_data = AudioSegment.from_file(audio_file)
 
     # Convert AudioSegment to raw data

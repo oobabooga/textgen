@@ -356,7 +356,20 @@ async def handle_audio_transcription(request: Request):
     r = sr.Recognizer()
 
     form = await request.form()
-    audio_file = await form["file"].read()
+    file = form["file"]
+
+    # Sanitize filename and validate file extension
+    filename = os.path.basename(file.filename or '')
+    ext = os.path.splitext(filename)[1].lower()
+    allowed_extensions = {'.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm', '.ogg', '.flac'}
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    # Enforce file size limit (25 MB)
+    audio_file = await file.read()
+    if len(audio_file) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large")
+
     audio_data = AudioSegment.from_file(audio_file)
 
     # Convert AudioSegment to raw data

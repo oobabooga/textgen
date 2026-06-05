@@ -34,7 +34,7 @@ def _validate_url(url):
     try:
         for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
             ip = ipaddress.ip_address(sockaddr[0])
-            if not ip.is_global:
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or not ip.is_global:
                 raise ValueError(f"Access to non-public address {ip} is blocked")
     except socket.gaierror:
         raise ValueError(f"Could not resolve hostname: {hostname}")

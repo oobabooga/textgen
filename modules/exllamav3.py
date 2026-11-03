@@ -66,6 +66,9 @@ class ConcurrentGenerator:
         self.generator = generator
         self.lock = threading.Lock()
         self.job_queues = {}
+        # cancel() only queues the job: it runs from generator finalizers, which the GC can execute on
+        # the generator thread while it holds self.lock (a plain Lock; taking it again there deadlocks)
+        self.cancelled = queue.SimpleQueue()
         self.active = True
         self.has_jobs = threading.Event()
         self.thread = threading.Thread(target=self._iterate_loop, daemon=True)
@@ -75,6 +78,15 @@ class ConcurrentGenerator:
         while self.active:
             self.has_jobs.wait(timeout=0.5)
             with self.lock:
+                while True:
+                    try:
+                        job = self.cancelled.get_nowait()
+                    except queue.Empty:
+                        break
+                    q = self.job_queues.pop(job, None)
+                    if q is not None:
+                        self.generator.cancel(job)
+                        q.put(None)
                 if not self.job_queues:
                     self.has_jobs.clear()
                     continue
@@ -107,11 +119,9 @@ class ConcurrentGenerator:
         return q
 
     def cancel(self, job):
-        with self.lock:
-            if job in self.job_queues:
-                self.generator.cancel(job)
-                self.job_queues[job].put(None)
-                del self.job_queues[job]
+        # Never blocks (SimpleQueue.put is reentrant); the generator thread drops the job before its next iterate()
+        self.cancelled.put(job)
+        self.has_jobs.set()
 
     def stop(self):
         self.active = False
@@ -278,6 +288,10 @@ class Exllamav3Model:
         result.model = model
         result.cache = cache
         result.tokenizer = tokenizer
+        # API threads tokenize with their own instance and lock; the generator thread decodes with `tokenizer`
+        # inside iterate(). Tokenizing then never waits on, or (from a finalizer) re-enters, the generator lock
+        result.api_tokenizer = Tokenizer.from_config(config)
+        result.tokenizer_lock = threading.RLock()
         result.generator = generator
         result.parallel_generator = ConcurrentGenerator(generator)
         result.config = config
@@ -418,8 +432,8 @@ class Exllamav3Model:
 
             sampler = CustomSampler(ordered_samplers)
 
-        with self.parallel_generator.lock:  # the tokenizer is not thread-safe and the generator thread uses it too
-            input_ids = self.tokenizer.encode(
+        with self.tokenizer_lock:  # one HF tokenizer instance raises "Already borrowed" when used concurrently
+            input_ids = self.api_tokenizer.encode(
                 prompt,
                 add_bos=state['add_bos_token'],
                 encode_special_tokens=True,
@@ -509,8 +523,8 @@ class Exllamav3Model:
             return
 
         if not hasattr(self, '_id_to_piece'):
-            with self.parallel_generator.lock:
-                self._id_to_piece = self.tokenizer.get_id_to_piece_list(True)
+            with self.tokenizer_lock:
+                self._id_to_piece = self.api_tokenizer.get_id_to_piece_list(True)
 
         id_to_piece = self._id_to_piece
 
@@ -584,15 +598,15 @@ class Exllamav3Model:
         add_bos = kwargs.pop('add_bos', True)
         if add_bos and self.tokenizer.bos_token and string.startswith(self.tokenizer.bos_token):
             add_bos = False
-        with self.parallel_generator.lock:
-            return self.tokenizer.encode(string, add_bos=add_bos, **kwargs)
+        with self.tokenizer_lock:
+            return self.api_tokenizer.encode(string, add_bos=add_bos, **kwargs)
 
     def decode(self, ids, **kwargs):
         if isinstance(ids, torch.Tensor) and ids.dim() == 0:
             ids = ids.view(1)
 
-        with self.parallel_generator.lock:
-            return self.tokenizer.decode(ids, **kwargs)
+        with self.tokenizer_lock:
+            return self.api_tokenizer.decode(ids, **kwargs)
 
     @property
     def last_prompt_token_count(self):
@@ -629,3 +643,4 @@ class Exllamav3Model:
         self.cache = None
         self.generator = None
         self.tokenizer = None
+        self.api_tokenizer = None

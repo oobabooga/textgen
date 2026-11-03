@@ -4,6 +4,15 @@ import time
 from modules import shared
 
 
+def _image_parts(blocks):
+    """Convert Anthropic base64 image blocks into OpenAI image_url parts."""
+    return [
+        {"type": "image_url", "image_url": {"url": f"data:{b['source'].get('media_type', 'image/png')};base64,{b['source'].get('data', '')}"}}
+        for b in blocks
+        if isinstance(b, dict) and b.get('type') == 'image' and b.get('source', {}).get('type') == 'base64'
+    ]
+
+
 def convert_request(body: dict) -> dict:
     """Transform Anthropic Messages API body into the dict that chat_completions_common expects."""
     messages = []
@@ -74,26 +83,17 @@ def convert_request(body: dict) -> dict:
                     # Convert tool_result to OpenAI tool message
                     tool_content = block.get('content', '')
                     if isinstance(tool_content, list):
-                        tool_content = '\n'.join(
-                            b.get('text', '') for b in tool_content
-                            if isinstance(b, dict) and b.get('type') == 'text'
-                        )
+                        # Keep images: list content is read on any role, so they stay in the tool result
+                        tool_content = [{"type": "text", "text": b.get('text', '')} for b in tool_content if isinstance(b, dict) and b.get('type') == 'text'] + _image_parts(tool_content)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": block.get('tool_use_id', ''),
-                        "content": str(tool_content)
+                        "content": tool_content if isinstance(tool_content, list) else str(tool_content)
                     })
                 elif btype == 'text':
                     regular_parts.append({"type": "text", "text": block.get('text', '')})
                 elif btype == 'image':
-                    source = block.get('source', {})
-                    if source.get('type') == 'base64':
-                        media_type = source.get('media_type', 'image/png')
-                        data = source.get('data', '')
-                        regular_parts.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{media_type};base64,{data}"}
-                        })
+                    regular_parts += _image_parts([block])
                 elif btype == 'thinking':
                     pass  # Strip thinking blocks
 
@@ -130,8 +130,8 @@ def convert_request(body: dict) -> dict:
     result.setdefault('user_bio', None)
     result.setdefault('chat_template_str', None)
     result.setdefault('chat_instruct_command', 'Continue the chat dialogue below. Write a single reply for the character "<|character|>".\n\n<|prompt|>')
-    result.setdefault('frequency_penalty', None)
-    result.setdefault('presence_penalty', None)
+    result.setdefault('frequency_penalty', shared.args.frequency_penalty)
+    result.setdefault('presence_penalty', shared.args.presence_penalty)
     result.setdefault('logit_bias', None)
     result.setdefault('logprobs', None)
     result.setdefault('top_logprobs', None)
@@ -337,7 +337,6 @@ class StreamConverter:
                     "delta": {"type": "thinking_delta", "thinking": reasoning_content}
                 })
             })
-            return events
 
         # Text content
         text_content = delta.get('content')
@@ -368,7 +367,6 @@ class StreamConverter:
                     "delta": {"type": "text_delta", "text": text_content}
                 })
             })
-            return events
 
         # Tool calls in delta
         chunk_tool_calls = delta.get('tool_calls')

@@ -139,6 +139,8 @@ group = parser.add_argument_group('ExLlamaV3')
 group.add_argument('--gpu-split', type=str, help='Comma-separated list of VRAM (in GB) to use per GPU device for model layers. Example: 20,7,7.')
 group.add_argument('--enable-tp', '--enable_tp', action='store_true', help='Enable Tensor Parallelism (TP) to split the model across GPUs.')
 group.add_argument('--tp-backend', type=str, default='native', help='The backend for tensor parallelism. Valid options: native, nccl. Default: native.')
+group.add_argument('--moe-cpu-split', type=int, default=0, help='Run this many routed experts of each MoE layer on the CPU (system RAM), for models larger than VRAM. Often-used experts are moved to the GPU automatically. 0 = off.')
+group.add_argument('--moe-cpu-threads', type=int, default=0, help='CPU threads for --moe-cpu-split. 0 = automatic.')
 group.add_argument('--cfg-cache', action='store_true', help='Create an additional cache for CFG negative prompts. Necessary to use CFG with that loader.')
 
 # Gradio

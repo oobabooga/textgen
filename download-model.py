@@ -118,7 +118,7 @@ class ModelDownloader:
                 is_gguf = re.match(r".*\.gguf", fname)
                 is_tiktoken = re.match(r".*\.tiktoken", fname)
                 is_tokenizer = re.match(r"(tokenizer|ice|spiece).*\.model", fname) or is_tiktoken
-                is_text = re.match(r".*\.(txt|json|py|md)", fname) or is_tokenizer
+                is_text = re.match(r".*\.(txt|json|py|md|jinja)", fname) or is_tokenizer
                 if any((is_pytorch, is_safetensors, is_pt, is_gguf, is_tokenizer, is_text)):
                     file_size = 0
                     if 'lfs' in dict[i]:

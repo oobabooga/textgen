@@ -75,6 +75,8 @@ def create_ui():
                             shared.gradio['cache_type'] = gr.Dropdown(label="cache-type", choices=['fp16', 'q8_0', 'q4_0', 'fp8', 'q8', 'q7', 'q6', 'q5', 'q4', 'q3', 'q2'], value=shared.args.cache_type, allow_custom_value=True, info='Valid options: llama.cpp - fp16, q8_0, q4_0; ExLlamaV3 - fp16, q2 to q8. For ExLlamaV3, you can type custom combinations for separate k/v bits (e.g. q4_q8).')
                             shared.gradio['split_mode'] = gr.Dropdown(label='split-mode', choices=['layer', 'row', 'tensor', 'none'], value=shared.args.split_mode, info='How to split the model across multiple GPUs. "tensor" can make multi-GPU significantly faster.')
                             shared.gradio['tp_backend'] = gr.Dropdown(label="tp-backend", choices=['native', 'nccl'], value=shared.args.tp_backend, info='The backend for tensor parallelism.')
+                            shared.gradio['moe_cpu_split'] = gr.Number(label='moe-cpu-split', precision=0, minimum=0, value=shared.args.moe_cpu_split, info='Routed experts of each MoE layer to run on the CPU, for models larger than VRAM. 0 = off.')
+                            shared.gradio['moe_cpu_threads'] = gr.Number(label='moe-cpu-threads', precision=0, minimum=0, value=shared.args.moe_cpu_threads, info='CPU threads for moe-cpu-split. 0 = automatic.')
 
                         with gr.Column():
                             shared.gradio['vram_info'] = gr.HTML(value=get_initial_vram_info())
@@ -220,8 +222,8 @@ def create_event_handlers():
         shared.gradio['lora_menu_apply'].click(load_lora_wrapper, gradio('lora_menu'), gradio('model_status'), show_progress=False)
 
     shared.gradio['spec_type'].change(
-        spec_type_visibility_updates,
-        gradio('spec_type'),
+        loader_spec_overlay,
+        gradio('loader', 'spec_type'),
         gradio(*SPEC_TYPE_OUTPUTS),
         show_progress=False
     )

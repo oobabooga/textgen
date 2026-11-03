@@ -1,5 +1,6 @@
 import math
 import queue
+import sys
 import threading
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -29,6 +30,7 @@ from modules.image_utils import (
 )
 from modules.logging_colors import logger
 from modules.text_generation import get_max_prompt_length
+from modules.utils import has_mtp_tensors
 
 try:
     import flash_attn
@@ -64,6 +66,9 @@ class ConcurrentGenerator:
         self.generator = generator
         self.lock = threading.Lock()
         self.job_queues = {}
+        # cancel() only queues the job: it runs from generator finalizers, which the GC can execute on
+        # the generator thread while it holds self.lock (a plain Lock; taking it again there deadlocks)
+        self.cancelled = queue.SimpleQueue()
         self.active = True
         self.has_jobs = threading.Event()
         self.thread = threading.Thread(target=self._iterate_loop, daemon=True)
@@ -73,6 +78,15 @@ class ConcurrentGenerator:
         while self.active:
             self.has_jobs.wait(timeout=0.5)
             with self.lock:
+                while True:
+                    try:
+                        job = self.cancelled.get_nowait()
+                    except queue.Empty:
+                        break
+                    q = self.job_queues.pop(job, None)
+                    if q is not None:
+                        self.generator.cancel(job)
+                        q.put(None)
                 if not self.job_queues:
                     self.has_jobs.clear()
                     continue
@@ -99,22 +113,32 @@ class ConcurrentGenerator:
     def submit(self, job) -> queue.Queue:
         q = queue.Queue()
         with self.lock:
+            self.generator.enqueue(job)  # first: a job it rejects must not stay registered
             self.job_queues[job] = q
-            self.generator.enqueue(job)
         self.has_jobs.set()
         return q
 
     def cancel(self, job):
-        with self.lock:
-            if job in self.job_queues:
-                self.generator.cancel(job)
-                self.job_queues[job].put(None)
-                del self.job_queues[job]
+        # Never blocks (SimpleQueue.put is reentrant); the generator thread drops the job before its next iterate()
+        self.cancelled.put(job)
+        self.has_jobs.set()
 
     def stop(self):
         self.active = False
         self.has_jobs.set()
         self.thread.join(timeout=5)
+
+
+def release_moe_cpu(config):
+    # exllamav3 only stops a CPU MoE worker once its last offloaded layer unloads, and pins
+    # this process to spare cores once per process; undo both so the next model starts clean
+    for host in getattr(config, 'moe_cpu_hosts', {}).values():
+        host.shutdown()
+    mch = sys.modules.get('exllamav3.model.moe_cpu_host')
+    if mch is not None:
+        if mch._HOST_ORIG_CPUS is not None:
+            mch.apply_process_affinity(mch._HOST_ORIG_CPUS)
+        mch._HOST_AFFINITY_THREADS = mch._HOST_ORIG_CPUS = None
 
 
 class Exllamav3Model:
@@ -169,8 +193,6 @@ class Exllamav3Model:
             logger.warning(f"Unrecognized cache type: {cache_type}. Falling back to fp16.")
             layer_type = CacheLayer_fp16
 
-        cache = Cache(model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
-
         load_params = {'progressbar': True}
         split = None
         if shared.args.gpu_split:
@@ -198,10 +220,21 @@ class Exllamav3Model:
         else:
             logger.info("No vision component in model config. Skipping multimodal setup.")
 
+        # Set after the vision load, which would otherwise spawn an idle CPU MoE worker
+        if shared.args.moe_cpu_split:
+            # The pinned arena lets experts that miss on the GPU be promoted into spare GPU slots
+            config.infer_params.moe_cpu_split = int(shared.args.moe_cpu_split)
+            config.infer_params.moe_cpu_pinned_arena = True
+            if shared.args.moe_cpu_threads:
+                # draft_moe_cpu_threads covers the MTP head, which shares this config
+                config.infer_params.moe_cpu_threads = config.infer_params.draft_moe_cpu_threads = int(shared.args.moe_cpu_threads)
+
         # Initialize draft model for speculative decoding
         draft_model = None
         draft_cache = None
-        if shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]:
+        num_draft_tokens = 0
+        has_model_draft = shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]
+        if shared.args.spec_type == 'none' and has_model_draft:
             logger.info(f"Loading draft model for speculative decoding: {shared.args.model_draft}")
 
             draft_path = Path(shared.args.model_draft)
@@ -213,17 +246,33 @@ class Exllamav3Model:
             else:
                 draft_config = Config.from_directory(str(draft_path))
                 draft_model = Model.from_config(draft_config)
+        elif shared.args.spec_type == 'draft-mtp' and 'mtp' in config.model_classes and has_mtp_tensors(config.stc.tensor_file_map):
+            logger.info("Loading the model's MTP head for speculative decoding" + (f" (spec-type none would use {shared.args.model_draft} instead)" if has_model_draft else ""))
+            draft_model = Model.from_config(config, component="mtp")
+        elif shared.args.spec_type != 'none':
+            logger.warning(f"spec-type {shared.args.spec_type} is not available for this model with ExLlamav3, speculative decoding disabled.")
+
+        try:
+            if draft_model is not None:
+                num_draft_tokens = shared.args.draft_max
+                if draft_model.caps.get("dflash_draft"):  # a DFlash drafter drafts at most one block
+                    num_draft_tokens = min(num_draft_tokens, draft_model.caps["default_draft_size"])
+
+                # Verifying drafted tokens needs extra cache room
+                cache_kwargs['max_history'] = max(num_draft_tokens, draft_model.caps.get("default_draft_size", 4))
                 draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
+                draft_model.load(progressbar=True, use_per_device=split)
+                logger.info(f"Draft model loaded successfully. Max speculative tokens: {num_draft_tokens}")
+                load_params['draft_model'] = draft_model  # DFlash drafters add to the main model's VRAM budget
 
-                draft_load_params = {'progressbar': True}
-                if split:
-                    draft_load_params['use_per_device'] = split
+            cache = Cache(model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
 
-                draft_model.load(**draft_load_params)
-                logger.info(f"Draft model loaded successfully. Max speculative tokens: {shared.args.draft_max}")
+            # Load main model last
+            model.load(**load_params)
+        except Exception:
+            release_moe_cpu(config)
+            raise
 
-        # Load main model last
-        model.load(**load_params)
         tokenizer = Tokenizer.from_config(config)
 
         generator = Generator(
@@ -232,13 +281,17 @@ class Exllamav3Model:
             tokenizer=tokenizer,
             draft_model=draft_model,
             draft_cache=draft_cache,
-            num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
+            num_draft_tokens=num_draft_tokens,
         )
 
         result = cls()
         result.model = model
         result.cache = cache
         result.tokenizer = tokenizer
+        # API threads tokenize with their own instance and lock; the generator thread decodes with `tokenizer`
+        # inside iterate(). Tokenizing then never waits on, or (from a finalizer) re-enters, the generator lock
+        result.api_tokenizer = Tokenizer.from_config(config)
+        result.tokenizer_lock = threading.RLock()
         result.generator = generator
         result.parallel_generator = ConcurrentGenerator(generator)
         result.config = config
@@ -379,12 +432,13 @@ class Exllamav3Model:
 
             sampler = CustomSampler(ordered_samplers)
 
-        input_ids = self.tokenizer.encode(
-            prompt,
-            add_bos=state['add_bos_token'],
-            encode_special_tokens=True,
-            embeddings=image_embeddings,
-        )
+        with self.tokenizer_lock:  # one HF tokenizer instance raises "Already borrowed" when used concurrently
+            input_ids = self.api_tokenizer.encode(
+                prompt,
+                add_bos=state['add_bos_token'],
+                encode_special_tokens=True,
+                embeddings=image_embeddings,
+            )
 
         input_ids = input_ids[:, -get_max_prompt_length(state):]
 
@@ -439,21 +493,25 @@ class Exllamav3Model:
                     result = result_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if result is None or result.get("eos"):
-                    if result is not None and return_top_tokens > 0:
-                        self._capture_logprobs(result)
+                if result is None:
                     break
+                if result.get("stage") == "error":
+                    raise result["error"]
                 chunk = result.get("text", "")
                 if return_top_tokens > 0:
                     self._capture_logprobs(result)
 
                 step_tokens = result.get("token_ids")
                 if step_tokens is not None:
-                    self.last_completion_token_count += len(step_tokens)
+                    self.last_completion_token_count += step_tokens.shape[-1]
 
                 if chunk:
                     response_text += chunk
                     yield response_text
+
+                # The final result can still carry text and tokens
+                if result.get("eos"):
+                    break
         finally:
             self.parallel_generator.cancel(job)
 
@@ -465,7 +523,8 @@ class Exllamav3Model:
             return
 
         if not hasattr(self, '_id_to_piece'):
-            self._id_to_piece = self.tokenizer.get_id_to_piece_list(True)
+            with self.tokenizer_lock:
+                self._id_to_piece = self.api_tokenizer.get_id_to_piece_list(True)
 
         id_to_piece = self._id_to_piece
 
@@ -539,13 +598,15 @@ class Exllamav3Model:
         add_bos = kwargs.pop('add_bos', True)
         if add_bos and self.tokenizer.bos_token and string.startswith(self.tokenizer.bos_token):
             add_bos = False
-        return self.tokenizer.encode(string, add_bos=add_bos, **kwargs)
+        with self.tokenizer_lock:
+            return self.api_tokenizer.encode(string, add_bos=add_bos, **kwargs)
 
     def decode(self, ids, **kwargs):
         if isinstance(ids, torch.Tensor) and ids.dim() == 0:
             ids = ids.view(1)
 
-        return self.tokenizer.decode(ids, **kwargs)
+        with self.tokenizer_lock:
+            return self.api_tokenizer.decode(ids, **kwargs)
 
     @property
     def last_prompt_token_count(self):
@@ -572,6 +633,8 @@ class Exllamav3Model:
             except Exception as e:
                 logger.warning(f"Error unloading main model: {e}")
 
+            release_moe_cpu(self.model.config)
+
         self.parallel_generator = None
         self.vision_model = None
         self.draft_model = None
@@ -580,3 +643,4 @@ class Exllamav3Model:
         self.cache = None
         self.generator = None
         self.tokenizer = None
+        self.api_tokenizer = None

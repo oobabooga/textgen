@@ -15,6 +15,11 @@ def gradio(*keys):
     return [shared.gradio[k] for k in keys]
 
 
+def has_mtp_tensors(tensor_names):
+    """Check for an MTP head (mtp.* tensors, or the eh_proj layer of DeepSeek/GLM-style MTP)."""
+    return any('mtp.' in k or '.eh_proj.' in k for k in tensor_names)
+
+
 def sanitize_filename(name):
     """Strip path traversal components from a filename.
 

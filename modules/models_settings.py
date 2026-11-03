@@ -99,11 +99,12 @@ def get_model_metadata(model):
             if 'pretrained_config' in metadata:
                 metadata = metadata['pretrained_config']
 
+            text_config = metadata.get('text_config') or {}  # may be null
             for k in ['max_position_embeddings', 'model_max_length', 'max_seq_len']:
                 if k in metadata:
                     value = metadata[k]
-                elif k in metadata.get('text_config', {}):
-                    value = metadata['text_config'][k]
+                elif k in text_config:
+                    value = text_config[k]
                 else:
                     continue
 
@@ -114,6 +115,20 @@ def get_model_metadata(model):
 
             if 'torch_dtype' in metadata and metadata['torch_dtype'] == 'bfloat16':
                 model_settings['bf16'] = True
+
+            # MTP models: check the quant kept the MTP head (some exports drop it)
+            mtp_config = {**metadata, **text_config}
+            if model_settings['loader'] == 'ExLlamav3' and (mtp_config.get('mtp_num_hidden_layers') or mtp_config.get('num_nextn_predict_layers')):
+                for path in sorted(model_path.glob('*.safetensors'), reverse=True):  # the MTP head is usually in the last shard
+                    try:
+                        with open(path, 'rb') as f:
+                            size = int.from_bytes(f.read(8), 'little')
+                            header = json.loads(f.read(size)) if size < 100_000_000 else {}  # safetensors header limit
+                    except (OSError, ValueError):  # e.g. a shard still downloading
+                        continue
+                    if utils.has_mtp_tensors(header):
+                        model_settings['spec_type'] = 'draft-mtp'
+                        break
 
     # Try to find the Jinja instruct template
     path = model_path / 'tokenizer_config.json'

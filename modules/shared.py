@@ -83,6 +83,7 @@ group.add_argument('--cache-type', '--cache_type', type=str, default='fp16', met
 # Speculative decoding
 group = parser.add_argument_group('Speculative decoding')
 group.add_argument('--model-draft', type=str, default=None, help='Path to the draft model for speculative decoding.')
+group.add_argument('--exllamav3-mtp', action='store_true', help='Enable the integrated MTP component in the ExLlamaV3 loader.')
 group.add_argument('--draft-max', type=int, default=3, help='Number of tokens to draft for speculative decoding.')
 group.add_argument('--gpu-layers-draft', type=int, default=256, help='Number of layers to offload to the GPU for the draft model.')
 group.add_argument('--device-draft', type=str, default=None, help='Comma-separated list of devices to use for offloading the draft model. Example: CUDA0,CUDA1')

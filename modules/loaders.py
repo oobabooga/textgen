@@ -61,6 +61,7 @@ loaders_and_params = OrderedDict({
         'tp_backend',
     ],
     'ExLlamav3': [
+        'exllamav3_mtp',
         'ctx_size',
         'cache_type',
         'gpu_split',
@@ -337,6 +338,7 @@ def list_model_elements():
         'no_use_fast',
         'model_draft',
         'draft_max',
+        'exllamav3_mtp',
         'gpu_layers_draft',
         'device_draft',
         'spec_type',

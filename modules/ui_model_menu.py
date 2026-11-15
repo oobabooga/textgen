@@ -101,6 +101,7 @@ def create_ui():
                             # Speculative decoding
                             with gr.Accordion("Speculative decoding", open=False) as shared.gradio['speculative_decoding_accordion']:
                                 shared.gradio['spec_type'] = gr.Dropdown(label="spec-type", choices=['none', 'draft-mtp', 'ngram-mod', 'ngram-simple', 'ngram-map-k', 'ngram-map-k4v'], value=shared.args.spec_type, info='Recommended: draft-mtp if the main model is an MTP build, otherwise ngram-mod.')
+                                shared.gradio['exllamav3_mtp'] = gr.Checkbox(label="exllamav3-mtp", value=shared.args.exllamav3_mtp, info="Use the model’s integrated MTP head with ExLlamaV3; cannot be combined with an external draft model.")
                                 shared.gradio['draft_max'] = gr.Number(label="draft-max", precision=0, step=1, value=shared.args.draft_max, info='Maximum number of tokens to draft per step. Recommended: 3 for draft-mtp or a draft model, 64 for n-gram.')
 
                                 shared.gradio['spec_ngram_size_n'] = gr.Number(label="spec-ngram-size-n", precision=0, step=1, value=shared.args.spec_ngram_size_n, info='N-gram lookup size for speculative decoding.', visible=shared.args.spec_type in NGRAM_SIZE_TYPES)

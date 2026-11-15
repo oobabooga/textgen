@@ -36,6 +36,19 @@ except Exception:
     logger.warning('Failed to load flash-attention due to the following error:', exc_info=True)
 
 
+def _validate_integrated_mtp(config, enabled, draft_name, draft_max):
+    if not enabled:
+        return
+    if draft_name and draft_name.lower() not in ('', 'none'):
+        raise ValueError("Integrated MTP and an external draft model cannot be enabled together.")
+    if draft_max < 1:
+        raise ValueError("Integrated MTP requires draft-max to be at least 1.")
+    if 'mtp' not in config.model_classes:
+        raise ValueError("This model configuration does not expose an integrated MTP component.")
+    if not any(config.stc.has_tensor(f'mtp.fc.{suffix}') for suffix in ('weight', 'trellis')):
+        raise ValueError("Integrated MTP weights are missing (mtp.fc.weight or mtp.fc.trellis).")
+
+
 class LogitBiasFilter(Filter):
     """Filter subclass that applies a static additive logit bias mask."""
 
@@ -135,119 +148,156 @@ class Exllamav3Model:
         global_allocator.next_token_index = FIRST_MM_EMBEDDING_INDEX
 
         config = Config.from_directory(str(path_to_model))
+        _validate_integrated_mtp(config, shared.args.exllamav3_mtp, shared.args.model_draft, shared.args.draft_max)
         model = Model.from_config(config)
 
-        # Adjust to the closest multiple of 256 at or above the chosen value
-        max_tokens = shared.args.ctx_size
-        if max_tokens % 256 != 0:
-            adjusted_tokens = ((max_tokens // 256) + 1) * 256
-            logger.warning(f"max_num_tokens must be a multiple of 256. Adjusting from {max_tokens} to {adjusted_tokens}")
-            max_tokens = adjusted_tokens
-
-        cache_type = shared.args.cache_type.lower()
-        cache_kwargs = {}
-        if cache_type == 'fp16':
-            layer_type = CacheLayer_fp16
-        elif cache_type.startswith('q'):
-            layer_type = CacheLayer_quant
-            if '_' in cache_type:
-                # Different bits for k and v (e.g., q4_q8)
-                k_part, v_part = cache_type.split('_')
-                k_bits = int(k_part[1:])
-                v_bits = int(v_part[1:])
-            else:
-                # Same bits for k and v (e.g., q4)
-                k_bits = v_bits = int(cache_type[1:])
-
-            # Validate bit ranges
-            if not (2 <= k_bits <= 8 and 2 <= v_bits <= 8):
-                logger.warning(f"Invalid quantization bits: k_bits={k_bits}, v_bits={v_bits}. Must be between 2 and 8. Falling back to fp16.")
-                layer_type = CacheLayer_fp16
-            else:
-                cache_kwargs = {'k_bits': k_bits, 'v_bits': v_bits}
-        else:
-            logger.warning(f"Unrecognized cache type: {cache_type}. Falling back to fp16.")
-            layer_type = CacheLayer_fp16
-
-        cache = Cache(model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
-
-        load_params = {'progressbar': True}
-        split = None
-        if shared.args.gpu_split:
-            split = [float(alloc) for alloc in shared.args.gpu_split.split(",")]
-            load_params['use_per_device'] = split
-
-        # Tensor-parallelism
-        if shared.args.enable_tp:
-            load_params['tensor_p'] = True
-            load_params['tp_backend'] = shared.args.tp_backend
-
-        # Load vision and draft before the main model so autosplit
-        # accounts for their VRAM usage.
-
-        # Load vision model component (ExLlamaV3 native)
         vision_model = None
-        if "vision_config" in config.config_dict:
-            logger.info("Vision component detected in model config. Attempting to load...")
-            try:
-                vision_model = Model.from_config(config, component="vision")
-                vision_model.load(progressbar=True)
-                logger.info("Vision model loaded successfully.")
-            except Exception as e:
-                logger.warning(f"Vision model loading failed (multimodal disabled): {e}")
-        else:
-            logger.info("No vision component in model config. Skipping multimodal setup.")
-
-        # Initialize draft model for speculative decoding
         draft_model = None
-        draft_cache = None
-        if shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]:
-            logger.info(f"Loading draft model for speculative decoding: {shared.args.model_draft}")
+        parallel_generator = None
+        try:
+            # Adjust to the closest multiple of 256 at or above the chosen value
+            max_tokens = shared.args.ctx_size
+            if max_tokens % 256 != 0:
+                adjusted_tokens = ((max_tokens // 256) + 1) * 256
+                logger.warning(f"max_num_tokens must be a multiple of 256. Adjusting from {max_tokens} to {adjusted_tokens}")
+                max_tokens = adjusted_tokens
 
-            draft_path = Path(shared.args.model_draft)
-            if not draft_path.is_dir():
-                draft_path = Path(f'{shared.args.model_dir}') / Path(shared.args.model_draft)
+            cache_type = shared.args.cache_type.lower()
+            cache_kwargs = {}
+            if cache_type == 'fp16':
+                layer_type = CacheLayer_fp16
+            elif cache_type.startswith('q'):
+                layer_type = CacheLayer_quant
+                if '_' in cache_type:
+                    # Different bits for k and v (e.g., q4_q8)
+                    k_part, v_part = cache_type.split('_')
+                    k_bits = int(k_part[1:])
+                    v_bits = int(v_part[1:])
+                else:
+                    # Same bits for k and v (e.g., q4)
+                    k_bits = v_bits = int(cache_type[1:])
 
-            if not draft_path.is_dir():
-                logger.warning(f"Draft model not found at {draft_path}, speculative decoding disabled.")
+                # Validate bit ranges
+                if not (2 <= k_bits <= 8 and 2 <= v_bits <= 8):
+                    logger.warning(f"Invalid quantization bits: k_bits={k_bits}, v_bits={v_bits}. Must be between 2 and 8. Falling back to fp16.")
+                    layer_type = CacheLayer_fp16
+                else:
+                    cache_kwargs = {'k_bits': k_bits, 'v_bits': v_bits}
             else:
-                draft_config = Config.from_directory(str(draft_path))
-                draft_model = Model.from_config(draft_config)
-                draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
+                logger.warning(f"Unrecognized cache type: {cache_type}. Falling back to fp16.")
+                layer_type = CacheLayer_fp16
 
+            if shared.args.exllamav3_mtp:
+                cache_kwargs['max_history'] = shared.args.draft_max
+            cache = Cache(model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
+
+            load_params = {'progressbar': True}
+            split = None
+            if shared.args.gpu_split:
+                split = [float(alloc) for alloc in shared.args.gpu_split.split(",")]
+                load_params['use_per_device'] = split
+
+            # Tensor-parallelism
+            if shared.args.enable_tp:
+                load_params['tensor_p'] = True
+                load_params['tp_backend'] = shared.args.tp_backend
+
+            # Load vision and draft before the main model so autosplit
+            # accounts for their VRAM usage.
+
+            # Load vision model component (ExLlamaV3 native)
+            vision_model = None
+            if "vision_config" in config.config_dict:
+                logger.info("Vision component detected in model config. Attempting to load...")
+                try:
+                    vision_model = Model.from_config(config, component="vision")
+                    vision_model.load(progressbar=True)
+                    logger.info("Vision model loaded successfully.")
+                except Exception as e:
+                    if vision_model is not None:
+                        try:
+                            vision_model.unload()
+                        except Exception:
+                            logger.exception("Error cleaning up vision model after load failure")
+                        vision_model = None
+                    logger.warning(f"Vision model loading failed (multimodal disabled): {e}")
+            else:
+                logger.info("No vision component in model config. Skipping multimodal setup.")
+
+            # Initialize draft model for speculative decoding
+            draft_model = None
+            draft_cache = None
+            if shared.args.exllamav3_mtp:
+                logger.info("Loading integrated MTP component for speculative decoding.")
+                draft_model = Model.from_config(config, component="mtp")
+                draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
                 draft_load_params = {'progressbar': True}
                 if split:
                     draft_load_params['use_per_device'] = split
-
                 draft_model.load(**draft_load_params)
-                logger.info(f"Draft model loaded successfully. Max speculative tokens: {shared.args.draft_max}")
+            elif shared.args.model_draft and shared.args.model_draft.lower() not in ["", "none"]:
+                logger.info(f"Loading draft model for speculative decoding: {shared.args.model_draft}")
 
-        # Load main model last
-        model.load(**load_params)
-        tokenizer = Tokenizer.from_config(config)
+                draft_path = Path(shared.args.model_draft)
+                if not draft_path.is_dir():
+                    draft_path = Path(f'{shared.args.model_dir}') / Path(shared.args.model_draft)
 
-        generator = Generator(
-            model=model,
-            cache=cache,
-            tokenizer=tokenizer,
-            draft_model=draft_model,
-            draft_cache=draft_cache,
-            num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
-        )
+                if not draft_path.is_dir():
+                    logger.warning(f"Draft model not found at {draft_path}, speculative decoding disabled.")
+                else:
+                    draft_config = Config.from_directory(str(draft_path))
+                    draft_model = Model.from_config(draft_config)
+                    draft_cache = Cache(draft_model, max_num_tokens=max_tokens, layer_type=layer_type, **cache_kwargs)
 
-        result = cls()
-        result.model = model
-        result.cache = cache
-        result.tokenizer = tokenizer
-        result.generator = generator
-        result.parallel_generator = ConcurrentGenerator(generator)
-        result.config = config
-        result.max_tokens = max_tokens
-        result.vision_model = vision_model
-        result.draft_model = draft_model
-        result.draft_cache = draft_cache
+                    draft_load_params = {'progressbar': True}
+                    if split:
+                        draft_load_params['use_per_device'] = split
 
-        return result, result
+                    draft_model.load(**draft_load_params)
+                    logger.info(f"Draft model loaded successfully. Max speculative tokens: {shared.args.draft_max}")
+
+            # Load main model last
+            if shared.args.exllamav3_mtp:
+                load_params['draft_model'] = draft_model
+            model.load(**load_params)
+            tokenizer = Tokenizer.from_config(config)
+
+            generator = Generator(
+                model=model,
+                cache=cache,
+                tokenizer=tokenizer,
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                num_draft_tokens=shared.args.draft_max if draft_model is not None else 0,
+            )
+
+            result = cls()
+            result.model = model
+            result.cache = cache
+            result.tokenizer = tokenizer
+            result.generator = generator
+            parallel_generator = ConcurrentGenerator(generator)
+            result.parallel_generator = parallel_generator
+            result.config = config
+            result.max_tokens = max_tokens
+            result.vision_model = vision_model
+            result.draft_model = draft_model
+            result.draft_cache = draft_cache
+
+            return result, result
+        except Exception:
+            if parallel_generator is not None:
+                try:
+                    parallel_generator.stop()
+                except Exception:
+                    logger.exception("Error stopping generator after load failure")
+            for component in (draft_model, vision_model, model):
+                if component is not None:
+                    try:
+                        component.unload()
+                    except Exception:
+                        logger.exception("Error cleaning up ExLlamaV3 component after load failure")
+            raise
 
     def is_multimodal(self) -> bool:
         """Check if this model supports multimodal input."""
@@ -565,6 +615,12 @@ class Exllamav3Model:
                 self.draft_model.unload()
             except Exception as e:
                 logger.warning(f"Error unloading draft model: {e}")
+
+        if self.vision_model is not None:
+            try:
+                self.vision_model.unload()
+            except Exception as e:
+                logger.warning(f"Error unloading vision model: {e}")
 
         if self.model is not None:
             try:

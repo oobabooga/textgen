@@ -103,6 +103,8 @@ https://mcp.parallel.ai/mcp?tools=web_search,User-Agent: TextGen
 
 With a tool-capable model loaded, uncheck the built-in `web_search` under **Tools** if it is selected so the model can use Parallel's search tool. Try asking, “Use `web_search` to find the Python documentation on virtual environments. Give me the source URL and a short excerpt.”
 
+If search returns results but the reply fails, try a larger context window. With llama.cpp, increase **ctx-size** in the **Model** tab and reload the model.
+
 Search queries go to Parallel and work without an API key. Remove the server line to disconnect it. See the [Parallel MCP setup guide](https://docs.parallel.ai/integrations/mcp/installation).
 
 ### Stdio servers

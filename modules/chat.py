@@ -2112,7 +2112,7 @@ def generate_pfp_cache(character):
             thumb = make_thumbnail(original_img)
             thumb.save(thumb_path, format='PNG')
 
-            return str(thumb_path)
+            return str(pfp_path)
 
     return None
 

@@ -1517,8 +1517,11 @@ def generate_chat_reply_wrapper(text, state, regenerate=False, _continue=False):
                 last_save_time = current_time
 
             # Early stop on tool call detection
-            if tool_func_names and parse_tool_call(history['internal'][-1][1], tool_func_names, parsers=_tool_parsers):
+            if history['internal'] and tool_func_names and parse_tool_call(history['internal'][-1][1], tool_func_names, parsers=_tool_parsers):
                 break
+
+        if not history['internal'] or not history['visible']:
+            break
 
         # Save the model's visible output before re-applying visible_prefix,
         # so we can extract thinking content from just this turn's output.

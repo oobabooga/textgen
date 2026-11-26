@@ -293,7 +293,7 @@ def parse_ebnf(src):
         state.grammar_encoding.append(0xFFFF)
         return state
     except RuntimeError as err:
-        logger.warning("error parsing grammar:", err)
+        logger.warning("error parsing grammar: %s", err)
         return ParseState()
 
 

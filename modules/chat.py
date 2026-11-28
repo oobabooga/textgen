@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import markupsafe
 import yaml
@@ -1829,12 +1830,19 @@ def save_history(history, unique_id, character, mode):
         return
 
     p = get_history_file_path(unique_id, character, mode)
-    if not p.parent.is_dir():
-        p.parent.mkdir(parents=True)
+    p.parent.mkdir(parents=True, exist_ok=True)
 
     with _history_file_lock:
-        with open(p, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(history, indent=4, ensure_ascii=False))
+        content = json.dumps(history, indent=4, ensure_ascii=False)
+        temporary_path = None
+        try:
+            with NamedTemporaryFile('w', encoding='utf-8', dir=p.parent, suffix='.tmp', delete=False) as f:
+                temporary_path = Path(f.name)
+                f.write(content)
+            temporary_path.replace(p)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 def rename_history(old_id, new_id, character, mode):
